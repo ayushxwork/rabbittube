@@ -1,0 +1,109 @@
+[
+  {
+    "video_id": "xpDnVSmNFX0",
+    "title": "System Design BASICS: Horizontal vs. Vertical Scaling",
+    "summary": "Highly recommended resource for system design.",
+    "topic": "System Design",
+    "distinct_users": 3,
+    "distinct_months": 3,
+    "mentions": [
+      {
+        "id": "c101",
+        "author": "tech_lead_blr",
+        "created_utc": 1705312000,
+        "text": "For low level and high level design, Gaurav Sen is gold standard: https://www.youtube.com/watch?v=xpDnVSmNFX0 - his explanation on caching helped me clear Uber.",
+        "thread_title": "How to prepare for SDE-2 System Design rounds in Indian tech companies?",
+        "url": "https://reddit.com/r/developersIndia/comments/196x81a/comment/c101",
+        "label": "recommend",
+        "summary": "Highly recommended resource for system design.",
+        "topic": "System Design"
+      },
+      {
+        "id": "c102",
+        "author": "pune_coder",
+        "created_utc": 1710528000,
+        "text": "Start with this Gaurav Sen system design primer https://youtu.be/xpDnVSmNFX0 before diving into DDIA. Explains distributed caching clearly.",
+        "thread_title": "Resources for distributed systems fundamentals",
+        "url": "https://reddit.com/r/developersIndia/comments/201y92b/comment/c102",
+        "label": "recommend",
+        "summary": "Highly recommended resource for system design.",
+        "topic": "System Design"
+      },
+      {
+        "id": "c103",
+        "author": "gurgaon_dev",
+        "created_utc": 1715800000,
+        "text": "I always recommend this caching breakdown: https://www.youtube.com/watch?v=xpDnVSmNFX0 . Watch it at 1.25x speed.",
+        "thread_title": "System design interviews at Tier-1 companies",
+        "url": "https://reddit.com/r/developersIndia/comments/223z14c/comment/c103",
+        "label": "recommend",
+        "summary": "Highly recommended resource for system design.",
+        "topic": "System Design"
+      }
+    ]
+  },
+  {
+    "video_id": "tyB0ztf0DNY",
+    "title": "DP 1. Introduction to Dynamic Programming | Memoization | Tabulation | Space Optimization Techniques",
+    "summary": "Highly recommended resource for data structures & algorithms.",
+    "topic": "Data Structures & Algorithms",
+    "distinct_users": 2,
+    "distinct_months": 2,
+    "mentions": [
+      {
+        "id": "c201",
+        "author": "fresh_grad_2024",
+        "created_utc": 1706780000,
+        "text": "Striver's DSA video on dynamic programming is the absolute best: https://www.youtube.com/watch?v=tyB0ztf0DNY - clarified memoization completely.",
+        "thread_title": "Struggling with DP and graphs for product based company rounds",
+        "url": "https://reddit.com/r/developersIndia/comments/1af821a/comment/c201",
+        "label": "recommend",
+        "summary": "Highly recommended resource for data structures & algorithms.",
+        "topic": "Data Structures & Algorithms"
+      },
+      {
+        "id": "c202",
+        "author": "delhi_sde",
+        "created_utc": 1712860000,
+        "text": "Do not skip Striver's DP playlist intro: https://www.youtube.com/watch?v=tyB0ztf0DNY . It builds intuition from recursion.",
+        "thread_title": "How did you master dynamic programming?",
+        "url": "https://reddit.com/r/developersIndia/comments/1bv903d/comment/c202",
+        "label": "cite",
+        "summary": "Referenced in community discussion.",
+        "topic": "System Design"
+      }
+    ]
+  },
+  {
+    "video_id": "-qNSXK7s7_w",
+    "title": "Database Indexing Explained (with PostgreSQL)",
+    "summary": "Highly recommended resource for system design.",
+    "topic": "System Design",
+    "distinct_users": 2,
+    "distinct_months": 2,
+    "mentions": [
+      {
+        "id": "c301",
+        "author": "backend_ninja",
+        "created_utc": 1708100000,
+        "text": "Hussein Nasser explaining database indexing: https://www.youtube.com/watch?v=-qNSXK7s7_w . Must watch for any backend engineer working with Postgres or MySQL.",
+        "thread_title": "Deep dive resources for DB internals and B-trees",
+        "url": "https://reddit.com/r/developersIndia/comments/1asm99x/comment/c301",
+        "label": "recommend",
+        "summary": "Highly recommended resource for system design.",
+        "topic": "System Design"
+      },
+      {
+        "id": "c302",
+        "author": "hyderabad_lead",
+        "created_utc": 1714500000,
+        "text": "Check out this masterclass by Hussein Nasser: https://youtu.be/-qNSXK7s7_w . Best visual explanation of B-Trees and indexing overhead.",
+        "thread_title": "How to optimize slow queries with proper indexing",
+        "url": "https://reddit.com/r/developersIndia/comments/1cg892m/comment/c302",
+        "label": "recommend",
+        "summary": "Highly recommended resource for system design.",
+        "topic": "System Design"
+      }
+    ]
+  }
+]
