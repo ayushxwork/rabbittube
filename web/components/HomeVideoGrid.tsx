@@ -1,11 +1,11 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Video, getVideoChannel } from "../types";
+import { VideoCardData, getVideoChannel } from "../types";
 import VideoCard from "./VideoCard";
 
 interface HomeVideoGridProps {
-  initialVideos: Video[];
+  initialVideos: VideoCardData[];
   topics: string[];
 }
 
@@ -95,7 +95,7 @@ export default function HomeVideoGrid({ initialVideos, topics }: HomeVideoGridPr
           {selectedTopic !== "All" && ` in "${selectedTopic}"`}
           {searchQuery && ` matching "${searchQuery}"`}
         </span>
-        <span>Sorted by months, users, title</span>
+        <span>In ranked order</span>
       </div>
 
       {/* Video Grid */}

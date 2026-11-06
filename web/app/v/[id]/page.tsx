@@ -25,7 +25,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   }
   return {
     title: `${video.title} - VideoHub`,
-    description: video.summary || `Recommended on Hacker News by ${video.distinct_users} users.`,
+    description: video.summary || `Linked on Hacker News by ${video.distinct_users} users.`,
   };
 }
 
@@ -40,12 +40,11 @@ export default async function VideoPage({ params }: PageProps) {
   const channel = getVideoChannel(video);
   const allComments = getVideoComments(video);
 
-  // Filter for comments labeled "recommend"
-  const recommendComments = allComments.filter(
-    (c) => c.label === "recommend" || !c.label
-  );
-  const displayComments =
-    recommendComments.length > 0 ? recommendComments : allComments;
+  // Comments labeled "recommend" first; then other labeled comments (max 8)
+  const recommendComments = allComments.filter((c) => c.label === "recommend");
+  const otherComments = allComments
+    .filter((c) => !!c.label && c.label !== "recommend" && c.label !== "unlabeled")
+    .slice(0, 8);
 
   return (
     <div className="max-w-4xl mx-auto space-y-8">
@@ -79,7 +78,10 @@ export default async function VideoPage({ params }: PageProps) {
               </span>
               <span>•</span>
               <span className="text-neutral-500">
-                Recommended by {video.distinct_users} {video.distinct_users === 1 ? "person" : "people"} over {video.distinct_months} {video.distinct_months === 1 ? "month" : "months"}
+                Linked by {video.distinct_users} {video.distinct_users === 1 ? "person" : "people"} over {video.distinct_months} {video.distinct_months === 1 ? "month" : "months"}
+                {typeof video.first_linked_year === "number" && typeof video.last_linked_year === "number" && (
+                  <> · First linked {video.first_linked_year} · last linked {video.last_linked_year}</>
+                )}
               </span>
             </div>
           </div>
@@ -101,57 +103,86 @@ export default async function VideoPage({ params }: PageProps) {
         )}
       </div>
 
-      {/* Community Recommendations / Comments Section */}
-      <div className="space-y-4">
-        <div>
-          <h2 className="text-lg font-bold tracking-tight">
-            Community Endorsements ({displayComments.length})
-          </h2>
-          <p className="text-xs text-neutral-500 dark:text-neutral-400">
-            Hacker News comments recommending this video, with direct links to discussion threads.
+      {/* Comments Section */}
+      <div className="space-y-8">
+        {recommendComments.length === 0 && otherComments.length === 0 ? (
+          <p className="text-sm text-neutral-500 dark:text-neutral-400">
+            No labeled comments yet.
           </p>
-        </div>
+        ) : (
+          <>
+            {recommendComments.length > 0 && (
+              <div className="space-y-4">
+                <h2 className="text-lg font-bold tracking-tight">
+                  Comments that recommend it
+                </h2>
+                <div className="space-y-3">
+                  {recommendComments.map((comment, idx) => (
+                    <div
+                      key={comment.id || idx}
+                      className="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-lg p-4 space-y-2"
+                    >
+                      <div className="flex items-center justify-between text-xs text-neutral-500 dark:text-neutral-400 border-b border-neutral-100 dark:border-neutral-800/60 pb-2">
+                        <span className="font-semibold text-neutral-800 dark:text-neutral-200">
+                          @{comment.author}
+                        </span>
+                        <a
+                          href={`https://news.ycombinator.com/item?id=${comment.id}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1 font-medium"
+                        >
+                          View HN Thread ↗
+                        </a>
+                      </div>
 
-        <div className="space-y-3">
-          {displayComments.map((comment, idx) => {
-            // Build HN thread or item URL
-            const itemUrl = comment.url && comment.url.startsWith("http")
-              ? comment.url
-              : `https://news.ycombinator.com/item?id=${comment.id}`;
-
-            return (
-              <div
-                key={comment.id || idx}
-                className="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-lg p-4 space-y-2"
-              >
-                <div className="flex items-center justify-between text-xs text-neutral-500 dark:text-neutral-400 border-b border-neutral-100 dark:border-neutral-800/60 pb-2">
-                  <div className="flex items-center gap-2">
-                    <span className="font-semibold text-neutral-800 dark:text-neutral-200">
-                      @{comment.author}
-                    </span>
-                    {comment.label && (
-                      <span className="bg-green-100 dark:bg-green-950/60 text-green-800 dark:text-green-300 text-[10px] font-bold uppercase px-1.5 py-0.5 rounded">
-                        {comment.label}
-                      </span>
-                    )}
-                  </div>
-                  <a
-                    href={itemUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1 font-medium"
-                  >
-                    View HN Thread ↗
-                  </a>
+                      <p className="text-xs sm:text-sm text-neutral-800 dark:text-neutral-200 whitespace-pre-line leading-relaxed">
+                        {comment.text}
+                      </p>
+                    </div>
+                  ))}
                 </div>
-
-                <p className="text-xs sm:text-sm text-neutral-800 dark:text-neutral-200 whitespace-pre-line leading-relaxed">
-                  {comment.text}
-                </p>
               </div>
-            );
-          })}
-        </div>
+            )}
+
+            {otherComments.length > 0 && (
+              <div className="space-y-4">
+                <h2 className="text-lg font-bold tracking-tight">Other mentions</h2>
+                <div className="space-y-3">
+                  {otherComments.map((comment, idx) => (
+                    <div
+                      key={comment.id || idx}
+                      className="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-lg p-4 space-y-2"
+                    >
+                      <div className="flex items-center justify-between text-xs text-neutral-500 dark:text-neutral-400 border-b border-neutral-100 dark:border-neutral-800/60 pb-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-neutral-800 dark:text-neutral-200">
+                            @{comment.author}
+                          </span>
+                          <span className="bg-green-100 dark:bg-green-950/60 text-green-800 dark:text-green-300 text-[10px] font-bold uppercase px-1.5 py-0.5 rounded">
+                            {comment.label}
+                          </span>
+                        </div>
+                        <a
+                          href={`https://news.ycombinator.com/item?id=${comment.id}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1 font-medium"
+                        >
+                          View HN Thread ↗
+                        </a>
+                      </div>
+
+                      <p className="text-xs sm:text-sm text-neutral-800 dark:text-neutral-200 whitespace-pre-line leading-relaxed">
+                        {comment.text}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </>
+        )}
       </div>
     </div>
   );

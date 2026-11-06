@@ -1,25 +1,41 @@
 import videosData from "../data/videos.json";
-import { Video } from "../types";
+import { Video, VideoCardData } from "../types";
 
+/** Videos in the exact order of videos.json — the pipeline already ranks them. */
 export function getAllVideos(): Video[] {
-  const videos = [...(videosData as Video[])];
-  return videos.sort((a, b) => {
-    // 1. distinct_months descending
-    if (b.distinct_months !== a.distinct_months) {
-      return b.distinct_months - a.distinct_months;
-    }
-    // 2. distinct_users descending
-    if (b.distinct_users !== a.distinct_users) {
-      return b.distinct_users - a.distinct_users;
-    }
-    // 3. title ascending
-    return a.title.localeCompare(b.title);
-  });
+  return [...(videosData as Video[])];
 }
 
 export function getVideoById(id: string): Video | undefined {
   const videos = videosData as Video[];
   return videos.find((v) => v.video_id === id);
+}
+
+/** Slim card fields only — keeps home page HTML small (no comment payloads). */
+export function getVideoCards(): VideoCardData[] {
+  return getAllVideos().map(
+    ({
+      video_id,
+      title,
+      channel,
+      summary,
+      topic,
+      distinct_users,
+      distinct_months,
+      first_linked_year,
+      last_linked_year,
+    }) => ({
+      video_id,
+      title,
+      channel,
+      summary,
+      topic,
+      distinct_users,
+      distinct_months,
+      first_linked_year,
+      last_linked_year,
+    })
+  );
 }
 
 export function getActiveTopics(): string[] {

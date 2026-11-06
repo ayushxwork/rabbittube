@@ -25,13 +25,17 @@ from openai import OpenAI
 # Constants & Configuration
 # ---------------------------------------------------------------------------
 # Threshold: Keep video only if at least N comments are labeled "recommend"
-MIN_RECOMMEND_COUNT = 2
+# (0 = no video is dropped for lacking "recommend" labels; labels still computed)
+MIN_RECOMMEND_COUNT = 0
 
-# Free-tier rate limits for gemini-2.0-flash (15 RPM -> 4.0s minimum interval)
-REQUEST_INTERVAL_SECONDS = 4.0
+# Free-tier rate limits: 15 RPM means >= 4.0s minimum interval per call;
+# 5.0s is used for headroom.
+REQUEST_INTERVAL_SECONDS = 5.0
 OEMBED_INTERVAL_SECONDS = 0.3
 MAX_RETRIES = 2  # retry up to 2 times on invalid LLM output (3 attempts total)
 MAX_429_RETRIES = 3
+MAX_5XX_RETRIES = 3  # transient HTTP 5xx: up to 3 retries (10s/20s/40s backoff)
+RETRYABLE_5XX = (500, 502, 503, 504)
 
 CACHE_DIR = "cache"
 CLASSIFICATION_CACHE_FILE = os.path.join(CACHE_DIR, "classifications.json")
@@ -92,41 +96,169 @@ def save_json_cache(filepath: str, cache_data: Dict[str, Any]) -> None:
     os.replace(temp_file, filepath)
 
 
+def redact_secrets(text: str) -> str:
+    """Strip API keys/credentials from text before printing or caching."""
+    if not text:
+        return ""
+    redacted = text
+    for env_name in ("GEMINI_API_KEY", "API_KEY", "OPENAI_API_KEY"):
+        value = os.getenv(env_name)
+        if value and len(value) >= 8:
+            redacted = redacted.replace(value, "***REDACTED***")
+    # Key-shaped tokens regardless of where they came from
+    redacted = re.sub(r"AIza[0-9A-Za-z_\-]{8,}", "***REDACTED***", redacted)
+    redacted = re.sub(r"\bsk-[0-9A-Za-z_\-]{8,}", "***REDACTED***", redacted)
+    redacted = re.sub(r"(?i)\bbearer\s+[0-9A-Za-z_\-\.\=]{8,}", "Bearer ***REDACTED***", redacted)
+    return redacted
+
+
+def extract_http_status(exc: BaseException) -> Optional[int]:
+    """Best-effort HTTP status code extraction from an API exception."""
+    for attr in ("status_code", "http_status"):
+        code = getattr(exc, attr, None)
+        if isinstance(code, int):
+            return code
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None) if response is not None else None
+    if isinstance(code, int):
+        return code
+    match = re.search(r"Error code:\s*(\d{3})", str(exc))
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def build_failure_info(
+    exc: Optional[BaseException], fallback_message: str = ""
+) -> Dict[str, Any]:
+    """Structured, secret-redacted failure record for the classification cache."""
+    if exc is not None:
+        message = redact_secrets(str(exc)) or redact_secrets(type(exc).__name__)
+        http_status = extract_http_status(exc)
+    else:
+        message = redact_secrets(fallback_message)
+        http_status = None
+    return {
+        "status": "failed",
+        "http_status": http_status,
+        "error": message[:500],
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def atomic_write_json(filepath: str, data: Any) -> None:
+    """Write JSON atomically (temp file + rename) so readers never see a partial file."""
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+    temp_file = f"{filepath}.tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(temp_file, filepath)
+
+
 # ---------------------------------------------------------------------------
 # Comment Selection
 # ---------------------------------------------------------------------------
-def select_candidate_comments(mentions: List[Dict[str, Any]], max_comments: int = 8, max_chars: int = 500) -> List[Dict[str, Any]]:
+def truncate_window_around_video_url(text: str, video_id: str, max_chars: int = 500) -> str:
+    """
+    Truncate `text` to `max_chars` using a window centered on the first
+    youtube.com / youtu.be URL that points at `video_id`, so that link is never
+    cut. Cut sides are marked with "...". Falls back to head truncation when no
+    such URL is found.
+    """
+    if len(text) <= max_chars:
+        return text
+
+    url_re = re.compile(
+        r"https?://(?:www\.|m\.)?(?:"
+        r"youtube\.com/(?:watch\?(?:[^#\s]*&)?v=|embed/|shorts/|v/|live/)"
+        r"|youtu\.be/)" + re.escape(video_id) + r"[^\s<>\"']*"
+    )
+    match = url_re.search(text)
+    if not match:
+        return text[:max_chars]
+
+    url_start, url_end = match.span()
+    url_len = url_end - url_start
+    total = len(text)
+    center = (url_start + url_end) // 2
+
+    # Budget of raw text after reserving "..." markers on both cut sides
+    budget = max_chars - 6
+    if budget >= url_len:
+        win_start = center - budget // 2
+        if win_start < 0:
+            win_start = 0
+        if win_start + budget > total:
+            win_start = total - budget
+        win_end = win_start + budget
+    else:
+        # Window cannot hold the link plus markers: keep the whole URL anyway.
+        win_start, win_end = url_start, url_end
+
+    prefix = "..." if win_start > 0 else ""
+    suffix = "..." if win_end < total else ""
+    return prefix + text[win_start:win_end] + suffix
+
+
+def select_candidate_comments(
+    mentions: List[Dict[str, Any]],
+    max_comments: int = 12,
+    max_chars: int = 500,
+    video_id: str = "",
+) -> List[Dict[str, Any]]:
     """
     Select up to `max_comments` mentions for classification:
-    - Prefers distinct authors first.
-    - Truncates comment text to `max_chars`.
+    - 6 SHORT: among comments whose URL-stripped text is >= 15 chars, the 6
+      with the shortest stripped length.
+    - 6 RICH: the richest of the remaining eligible comments (distinct authors
+      preferred). Bare links (< 15 stripped chars) are excluded entirely.
+      Fewer short comments are filled by rich ones and vice versa.
+    - Truncation keeps a window around this video's URL (see
+      truncate_window_around_video_url); original mention order is restored.
     """
-    selected: List[Dict[str, Any]] = []
-    seen_authors: Set[str] = set()
-    overflow: List[Dict[str, Any]] = []
 
-    for m in mentions:
-        author = m.get("author", "anonymous")
-        if author not in seen_authors:
-            seen_authors.add(author)
-            selected.append(m)
-            if len(selected) == max_comments:
-                break
-        else:
-            overflow.append(m)
+    def stripped_len(m: Dict[str, Any]) -> int:
+        return len(re.sub(r"https?://\S+", "", m.get("text", "")).strip())
 
-    if len(selected) < max_comments:
-        for m in overflow:
-            selected.append(m)
-            if len(selected) == max_comments:
-                break
+    short_quota = min(6, max_comments // 2)
+    rich_quota = max_comments - short_quota
 
-    # Prepare truncated copies
+    eligible = []
+    for i, m in enumerate(mentions):
+        s_len = stripped_len(m)
+        if s_len >= 15:
+            eligible.append((i, m, s_len))
+
+    # SHORT: the shortest eligible comments (original order breaks ties)
+    short_sel = sorted(eligible, key=lambda t: (t[2], t[0]))[:short_quota]
+    short_idx = {t[0] for t in short_sel}
+    remaining = [t for t in eligible if t[0] not in short_idx]
+
+    # RICH: richest of the remaining, distinct authors preferred
+    used_authors = {t[1].get("author", "anonymous") for t in short_sel}
+    rich_sorted = sorted(remaining, key=lambda t: (-t[2], t[0]))
+    rich_sel: List[Tuple[int, Dict[str, Any], int]] = []
+    for t in rich_sorted:
+        if len(rich_sel) >= rich_quota:
+            break
+        author = t[1].get("author", "anonymous")
+        if author in used_authors:
+            continue
+        used_authors.add(author)
+        rich_sel.append(t)
+    rich_idx = {t[0] for t in rich_sel}
+    for t in rich_sorted:
+        if len(rich_sel) >= rich_quota:
+            break
+        if t[0] in rich_idx:
+            continue
+        rich_sel.append(t)
+
+    # Restore original mention order, then window-truncate to max_chars
+    chosen = sorted(short_sel + rich_sel, key=lambda t: t[0])
     result = []
-    for m in selected:
-        text = m.get("text", "")
-        if len(text) > max_chars:
-            text = text[:max_chars]
+    for _, m, _ in chosen:
+        text = truncate_window_around_video_url(m.get("text", ""), video_id, max_chars)
         result.append({
             "id": str(m.get("id", "")),
             "author": m.get("author", "anonymous"),
@@ -214,6 +346,7 @@ def parse_and_validate_response(
         return False, None, "'comment_labels' must be a non-empty list"
 
     parsed_labels = []
+    seen_ids: Set[str] = set()
     for item in labels:
         if not isinstance(item, dict):
             return False, None, "Item in 'comment_labels' is not an object"
@@ -221,6 +354,10 @@ def parse_and_validate_response(
         label = str(item.get("label", "")).strip().lower()
         if label not in VALID_LABELS:
             return False, None, f"Invalid label '{label}' for comment {cid}. Must be in {VALID_LABELS}"
+        if cid in seen_ids:
+            # Exactly one label per comment_id: keep the first, drop duplicates.
+            continue
+        seen_ids.add(cid)
         parsed_labels.append({"comment_id": cid, "label": label})
 
     return True, {
@@ -236,10 +373,16 @@ def call_gemini_classification(
     video_id: str,
     comments: List[Dict[str, Any]],
     topics: List[str],
-) -> Optional[Dict[str, Any]]:
+    title: str = "",
+    channel: str = "",
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    Call Gemini API with retries and exponential backoff.
-    Returns validated classification dict or None on fatal failure/daily quota.
+    Call Gemini API with bounded retries and exponential backoff.
+    `title` and `channel` (from oEmbed) are included in the prompt so the
+    summary can describe the video itself.
+    Returns (classification_dict, None) on success, or
+    (None, failure_info) with secret-redacted error details on failure.
+    On daily quota exhaustion the process exits cleanly (progress is cached).
     """
     topics_list_str = ", ".join(f'"{t}"' for t in topics)
     comments_payload = "\n".join(
@@ -249,25 +392,48 @@ def call_gemini_classification(
     expected_ids = {c["id"] for c in comments}
 
     system_prompt = (
-        "You are an expert content analyzer indexing community recommendations from Hacker News.\n"
+        "You are an expert content analyzer indexing community discussions from Hacker News.\n"
         "Analyze the provided comments referencing a YouTube video and output strict JSON with:\n"
-        "1. 'summary': Exactly one sentence explaining what the video covers and why commenters recommend/discuss it.\n"
+        "1. 'summary': Describe the VIDEO itself in ONE sentence of at most 25 words, using the "
+        "video title and channel plus what the comments reveal about its content. "
+        "Never mention commenters, comments, discussion, or people. Do not start with 'The video'. "
+        "Example: \"A lecture by Dr. Robert Lustig arguing that fructose drives obesity and metabolic disease.\"\n"
         f"2. 'topic': Exactly one topic from this list: [{topics_list_str}].\n"
-        "3. 'comment_labels': An array of objects with 'comment_id' and 'label' for each comment.\n"
+        "   Definitions (pick the single best fit):\n"
+        "     coding = programming, software, systems, databases;\n"
+        "     tech-gadgets = consumer hardware and devices;\n"
+        "     science = natural sciences;\n"
+        "     math = mathematics;\n"
+        "     space = astronomy and space exploration;\n"
+        "     history = historical events and figures;\n"
+        "     money = finance and economics;\n"
+        "     startups = founding and building companies;\n"
+        "     culture = society, politics, law, media;\n"
+        "     other = anything else.\n"
+        "3. 'comment_labels': An array with EXACTLY ONE object per input comment_id. Every comment_id you "
+        "were given must appear exactly once - no duplicates, none missing.\n"
         "   Allowed label values:\n"
-        "   - 'recommend': The commenter endorses, praises, suggests, or shares the video as a good/helpful resource.\n"
-        "   - 'cite': The commenter links the video neutrally as background proof, timestamp, or reference without endorsing it.\n"
-        "   - 'joke': The commenter links the video for humor, meme, sarcasm, or punchline (e.g. Rickroll).\n"
-        "   - 'criticize': The commenter links the video to refute, warn against, or criticize it.\n"
+        "   - 'recommend': The commenter explicitly urges others to watch the video, or says it is worth "
+        "watching, excellent, or must-see (e.g. 'everyone needs to watch this').\n"
+        "   - 'cite': The commenter links the video as evidence, a source, or a quote supporting a point in "
+        "a discussion about something else (neutral references and timestamps count as cite).\n"
+        "   - 'joke': A meme or humorous reference to the video ('obligatory reference', 'for anyone too "
+        "young to get the reference', quoting a line for laughs).\n"
+        "   - 'criticize': The commenter says the video is wrong, bad, or misleading.\n"
+        "   RULE: when unsure, choose 'cite'. Use 'recommend' only when the commenter is clearly telling "
+        "others to watch the video.\n"
         "Output ONLY the JSON object. Do not include markdown formatting or extra text."
     )
 
     user_prompt = (
-        f"Video ID: {video_id}\n\n"
+        f"Video ID: {video_id}\n"
+        f"Title: {title}\n"
+        f"Channel: {channel}\n\n"
         f"Comments referencing this video:\n{comments_payload}\n\n"
         "Respond with strict JSON."
     )
 
+    coverage_retry_used = False
     for attempt in range(MAX_RETRIES + 1):
         backoff_sleep = 10.0
         for rate_retry in range(MAX_429_RETRIES + 1):
@@ -284,7 +450,8 @@ def call_gemini_classification(
                 raw_content = response.choices[0].message.content or ""
                 break
             except Exception as e:
-                err_msg = str(e)
+                err_msg = redact_secrets(str(e))
+                http_status = extract_http_status(e)
                 # Check for 429 rate limit or quota exhaustion
                 if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                     # Check if daily cap was hit
@@ -299,33 +466,90 @@ def call_gemini_classification(
                         backoff_sleep *= 2.0
                         continue
                     else:
-                        print(f"Exceeded 429 retries for video {video_id}: {e}")
-                        return None
+                        print(f"Exceeded 429 retries for video {video_id}: {err_msg}")
+                        return None, build_failure_info(e)
+                elif http_status in RETRYABLE_5XX:
+                    # Transient server-side errors: bounded retries with 10s/20s/40s backoff
+                    if rate_retry < MAX_5XX_RETRIES:
+                        print(f"HTTP {http_status} from Gemini for video {video_id}. Backing off {backoff_sleep:.1f}s before retry {rate_retry + 1}/{MAX_5XX_RETRIES}...")
+                        time.sleep(backoff_sleep)
+                        backoff_sleep *= 2.0
+                        continue
+                    else:
+                        print(f"Exceeded 5xx retries for video {video_id}: {err_msg}")
+                        return None, build_failure_info(e)
                 else:
-                    print(f"API call error for video {video_id}: {e}")
-                    return None
+                    print(f"API call error for video {video_id}: {err_msg}")
+                    return None, build_failure_info(e)
 
         # Validate JSON output
         is_valid, parsed_data, err_reason = parse_and_validate_response(raw_content, topics, expected_ids)
         if is_valid and parsed_data:
-            return parsed_data
+            # Exactly one label per input comment_id: retry once when any are
+            # missing, then accept and let the leftovers become "unlabeled".
+            labeled_ids = {item["comment_id"] for item in parsed_data.get("comment_labels", [])}
+            missing_ids = sorted(expected_ids - labeled_ids)
+            if missing_ids and not coverage_retry_used:
+                coverage_retry_used = True
+                print(
+                    f"Missing labels for {len(missing_ids)} comment(s) "
+                    f"({', '.join(missing_ids)}) - retrying once..."
+                )
+                time.sleep(2.0)
+                continue
+            if missing_ids:
+                print(
+                    f"Accepted with {len(missing_ids)} comment(s) left as "
+                    f"'unlabeled': {', '.join(missing_ids)}."
+                )
+            return parsed_data, None
 
         print(f"Validation failed for {video_id} (attempt {attempt + 1}/{MAX_RETRIES + 1}): {err_reason}")
         if attempt < MAX_RETRIES:
             time.sleep(2.0)
 
     print(f"Marking video {video_id} as 'failed' after {MAX_RETRIES + 1} attempts.")
-    return None
+    return None, build_failure_info(
+        None,
+        f"Invalid model output after {MAX_RETRIES + 1} attempts: {err_reason}",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main Classification Routine
 # ---------------------------------------------------------------------------
+def compute_recent_users(mentions: List[Dict[str, Any]], cutoff_ts: int) -> int:
+    """Distinct authors whose mention timestamp is at or after cutoff_ts (UTC)."""
+    recent: Set[str] = set()
+    for m in mentions:
+        ts = m.get("created_utc")
+        if isinstance(ts, (int, float)) and ts >= cutoff_ts:
+            recent.add(str(m.get("author", "anonymous")))
+    return len(recent)
+
+
+def linked_year_range(mentions: List[Dict[str, Any]]) -> Tuple[Optional[int], Optional[int]]:
+    """(first, last) UTC years of the mention timestamps; (None, None) if none are valid."""
+    years = []
+    for m in mentions:
+        ts = m.get("created_utc")
+        if not isinstance(ts, (int, float)):
+            continue
+        try:
+            years.append(time.gmtime(ts).tm_year)
+        except (OverflowError, OSError, ValueError):
+            continue
+    if not years:
+        return None, None
+    return min(years), max(years)
+
+
 def run_classification(
     candidates_file: str = DEFAULT_CANDIDATES_FILE,
     topics_file: str = DEFAULT_TOPICS_FILE,
     output_file: str = DEFAULT_OUTPUT_FILE,
     top: int = 300,
+    skip: int = 0,
     limit: Optional[int] = None,
 ) -> None:
     load_env()
@@ -360,16 +584,28 @@ def run_classification(
 
     print(f"Total candidates in {candidates_file}: {len(candidates)}")
 
-    # Sort candidates by distinct_months descending, then distinct_users descending
+    # Rank by recent activity: distinct authors active in the last 3 years
+    # (UTC) first, then total distinct users, then distinct months.
+    cutoff_ts = int(time.time()) - 3 * 365 * 24 * 3600
+    for c in candidates:
+        c["recent_users"] = compute_recent_users(c.get("mentions", []), cutoff_ts)
+
+    # Sort candidates by recent_users descending, then distinct_users
+    # descending, then distinct_months descending
     candidates.sort(
-        key=lambda c: (c.get("distinct_months", 0), c.get("distinct_users", 0)),
+        key=lambda c: (c.get("recent_users", 0), c.get("distinct_users", 0), c.get("distinct_months", 0)),
         reverse=True,
     )
+
+    # Skip the first N candidates after sorting (used to page through batches)
+    if skip:
+        candidates = candidates[skip:]
+        print(f"Skipped first {skip} candidates (--skip {skip}); {len(candidates)} remain.")
 
     # Slice top N candidates
     if top and len(candidates) > top:
         candidates = candidates[:top]
-        print(f"Filtered to top {top} candidates sorted by distinct_months then distinct_users.")
+        print(f"Filtered to top {top} candidates sorted by recent_users, then distinct_users, then distinct_months.")
 
     # Slice limit for testing
     if limit is not None:
@@ -380,15 +616,42 @@ def run_classification(
     classification_cache = load_json_cache(CLASSIFICATION_CACHE_FILE)
     oembed_cache = load_json_cache(OEMBED_CACHE_FILE)
 
-    # Count planned API requests
-    cached_count = sum(1 for c in candidates if c["video_id"] in classification_cache)
-    calls_needed = len(candidates) - cached_count
+    # Fetch oEmbed (title & channel) for every candidate BEFORE any Gemini
+    # call, reusing the on-disk cache with the usual 0.3s pacing. Unavailable
+    # videos (404/private/removed) are excluded from this batch and never
+    # reach Gemini.
+    print(f"Fetching oEmbed metadata for {len(candidates)} video(s) before any Gemini call...")
+    oembed_results: Dict[str, Optional[Dict[str, str]]] = {}
+    for cand in candidates:
+        oembed_results[cand["video_id"]] = fetch_youtube_oembed(cand["video_id"], oembed_cache)
+
+    # Plan counts (oEmbed ran first, so unavailable videos are known now):
+    #   unavailable -> no Gemini call, excluded from videos.json
+    #   cached      -> successful cache entries are reused
+    #   retry       -> entries with status "failed" are retried once per run
+    #   the rest    -> fresh Gemini calls
+    unavailable_count = 0
+    cached_count = 0
+    retry_count = 0
+    for c in candidates:
+        c_vid = c["video_id"]
+        c_entry = classification_cache.get(c_vid)
+        c_status = c_entry.get("status") if isinstance(c_entry, dict) else None
+        if oembed_results.get(c_vid) is None:
+            unavailable_count += 1
+        elif c_status in ("failed", "unavailable"):
+            retry_count += 1
+        elif c_entry is not None:
+            cached_count += 1
+    calls_needed = len(candidates) - unavailable_count - cached_count
 
     print("\n" + "=" * 60)
     print("PLANNING CLASSIFICATION BATCH")
     print("=" * 60)
     print(f"Target videos to classify:  {len(candidates)}")
+    print(f"Skipped as unavailable:     {unavailable_count}")
     print(f"Already cached on disk:     {cached_count}")
+    print(f"Failed, will retry once:    {retry_count}")
     print(f"API calls planned:          {calls_needed}")
     print(f"Model ID:                   {model}")
     print(f"Base URL:                   {base_url}")
@@ -403,21 +666,51 @@ def run_classification(
     for idx, cand in enumerate(candidates, 1):
         vid = cand["video_id"]
         mentions = cand.get("mentions", [])
-        sample_comments = select_candidate_comments(mentions, max_comments=8, max_chars=500)
 
-        # Check classification cache
-        if vid in classification_cache:
-            classification = classification_cache[vid]
+        # oEmbed (title & channel) was fetched BEFORE any Gemini call; reuse
+        # that result so videos.json keeps the same title/channel without a
+        # second oEmbed request.
+        oembed_data = oembed_results[vid]
+        if oembed_data is None:
+            # Unavailable (404/private/removed) or oEmbed lookup failed:
+            # do NOT call Gemini and exclude the video from videos.json.
+            if oembed_cache.get(vid, {}).get("status") == "unavailable":
+                if classification_cache.get(vid, {}).get("status") != "unavailable":
+                    classification_cache[vid] = {
+                        "status": "unavailable",
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                    save_json_cache(CLASSIFICATION_CACHE_FILE, classification_cache)
+                print(f"[{idx}/{len(candidates)}] {vid} -> SKIPPED as unavailable (no Gemini call).")
+            else:
+                print(f"[{idx}/{len(candidates)}] {vid} -> SKIPPED (oEmbed lookup failed; no Gemini call, retry next run).")
+            continue
+
+        sample_comments = select_candidate_comments(mentions, max_comments=12, max_chars=500, video_id=vid)
+
+        # Check classification cache: reuse successes, retry failures once per run
+        cached_entry = classification_cache.get(vid)
+        cached_status = cached_entry.get("status") if isinstance(cached_entry, dict) else None
+        cached_failed = cached_status == "failed"
+        if cached_entry is not None and not cached_failed and cached_status != "unavailable":
+            classification = cached_entry
             print(f"[{idx}/{len(candidates)}] {vid} -> loaded from classification cache.")
         else:
-            print(f"[{idx}/{len(candidates)}] {vid} -> calling Gemini API ({len(sample_comments)} comments)...", end=" ", flush=True)
-            classification = call_gemini_classification(client, model, vid, sample_comments, topics)
+            action = "retrying previously failed entry" if cached_failed else "calling Gemini API"
+            print(f"[{idx}/{len(candidates)}] {vid} -> {action} ({len(sample_comments)} comments)...", end=" ", flush=True)
+            classification, failure_info = call_gemini_classification(
+                client, model, vid, sample_comments, topics,
+                title=oembed_data.get("title", ""),
+                channel=oembed_data.get("channel", ""),
+            )
             if classification is not None:
                 classification_cache[vid] = classification
                 save_json_cache(CLASSIFICATION_CACHE_FILE, classification_cache)
                 print(f"Done. Topic: '{classification['topic']}'")
             else:
-                classification_cache[vid] = {"status": "failed"}
+                classification_cache[vid] = failure_info or build_failure_info(
+                    None, "Unknown classification failure"
+                )
                 save_json_cache(CLASSIFICATION_CACHE_FILE, classification_cache)
                 print("FAILED.")
             time.sleep(REQUEST_INTERVAL_SECONDS)
@@ -430,21 +723,22 @@ def run_classification(
         label_map = {item["comment_id"]: item["label"] for item in classification.get("comment_labels", [])}
         recommend_count = sum(1 for label in label_map.values() if label == "recommend")
 
-        # Fetch oEmbed (title & channel)
-        oembed_data = fetch_youtube_oembed(vid, oembed_cache)
+        first_linked_year, last_linked_year = linked_year_range(mentions)
 
         processed_results.append({
             "video_id": vid,
-            "title": oembed_data.get("title", "") if oembed_data else "Unavailable",
-            "channel": oembed_data.get("channel", "") if oembed_data else "Unavailable",
+            "title": oembed_data.get("title", ""),
+            "channel": oembed_data.get("channel", ""),
             "summary": classification.get("summary", ""),
             "topic": classification.get("topic", ""),
             "distinct_users": cand.get("distinct_users", 0),
             "distinct_months": cand.get("distinct_months", 0),
+            "first_linked_year": first_linked_year,
+            "last_linked_year": last_linked_year,
             "sample_comments": sample_comments,
             "label_map": label_map,
             "recommend_count": recommend_count,
-            "oembed_valid": (oembed_data is not None),
+            "oembed_valid": True,  # unavailable videos are skipped before this point
             "mentions": mentions,
         })
 
@@ -457,7 +751,7 @@ def run_classification(
             annotated_comments = []
             for m in item["mentions"]:
                 m_copy = dict(m)
-                m_copy["label"] = item["label_map"].get(str(m.get("id")), "recommend")
+                m_copy["label"] = item["label_map"].get(str(m.get("id")), "unlabeled")
                 annotated_comments.append(m_copy)
 
             kept_videos.append({
@@ -468,12 +762,22 @@ def run_classification(
                 "topic": item["topic"],
                 "distinct_users": item["distinct_users"],
                 "distinct_months": item["distinct_months"],
+                "first_linked_year": item["first_linked_year"],
+                "last_linked_year": item["last_linked_year"],
                 "comments": annotated_comments,
             })
 
-    # Write videos.json
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(kept_videos, f, indent=2, ensure_ascii=False)
+    # Write output atomically, and never destroy an existing dataset when this
+    # run produced no successful classifications (e.g. temporary API outage).
+    if kept_videos or not os.path.exists(output_file):
+        atomic_write_json(output_file, kept_videos)
+        write_action = f"Successfully saved {len(kept_videos)} kept videos to {output_file}."
+    else:
+        write_action = (
+            f"[PRESERVED] No successful classifications in this run; "
+            f"existing '{output_file}' was left untouched. "
+            f"Delete it first if you intentionally want an empty dataset."
+        )
 
     print("\n" + "=" * 60)
     print("CLASSIFICATION & VERIFICATION REPORT")
@@ -510,7 +814,7 @@ def run_classification(
             print(f"  * [{lbl.upper():^10}] ({author}): \"{txt}\"")
 
     print("\n" + "=" * 60)
-    print(f"Successfully saved {len(kept_videos)} kept videos to {output_file}.")
+    print(write_action)
     print("=" * 60 + "\n")
 
 
@@ -520,6 +824,7 @@ if __name__ == "__main__":
     parser.add_argument("--topics", default=DEFAULT_TOPICS_FILE, help="Path to topics.json")
     parser.add_argument("--output", default=DEFAULT_OUTPUT_FILE, help="Path to videos.json output")
     parser.add_argument("--top", type=int, default=300, help="Classify top N candidates (default: 300)")
+    parser.add_argument("--skip", type=int, default=0, help="Skip the first N candidates after sorting (before --top/--limit)")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of videos to classify (e.g. 5)")
     args = parser.parse_args()
 
@@ -528,5 +833,6 @@ if __name__ == "__main__":
         topics_file=args.topics,
         output_file=args.output,
         top=args.top,
+        skip=args.skip,
         limit=args.limit,
     )

@@ -5,7 +5,7 @@ import Footer from "../components/Footer";
 
 export const metadata: Metadata = {
   title: "VideoHub - Curated YouTube Index",
-  description: "A curated YouTube index of videos recommended by the Hacker News community.",
+  description: "A curated YouTube index of videos linked by the Hacker News community.",
 };
 
 export default function RootLayout({

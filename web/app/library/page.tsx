@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { getAllVideos } from "../../lib/data";
+import { getVideoCards } from "../../lib/data";
 import LibraryView from "../../components/LibraryView";
 
 export const metadata: Metadata = {
@@ -8,7 +8,7 @@ export const metadata: Metadata = {
 };
 
 export default function LibraryPage() {
-  const videos = getAllVideos();
+  const videos = getVideoCards();
 
   return <LibraryView allVideos={videos} />;
 }

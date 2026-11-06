@@ -2,11 +2,11 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
-import { Video, getVideoChannel } from "../types";
+import { VideoCardData, getVideoChannel } from "../types";
 import { isWatchLater, toggleWatchLater } from "../lib/storage";
 
 interface VideoCardProps {
-  video: Video;
+  video: VideoCardData;
 }
 
 export default function VideoCard({ video }: VideoCardProps) {
@@ -70,7 +70,10 @@ export default function VideoCard({ video }: VideoCardProps) {
         </p>
 
         <p className="text-[11px] text-neutral-500 dark:text-neutral-500 mt-0.5">
-          {video.distinct_users} {video.distinct_users === 1 ? "user" : "users"} · {video.distinct_months} {video.distinct_months === 1 ? "month" : "months"}
+          Linked by {video.distinct_users} {video.distinct_users === 1 ? "person" : "people"} over {video.distinct_months} {video.distinct_months === 1 ? "month" : "months"}
+          {typeof video.first_linked_year === "number" && typeof video.last_linked_year === "number" && (
+            <> · First linked {video.first_linked_year} · last linked {video.last_linked_year}</>
+          )}
         </p>
 
         {video.summary && (

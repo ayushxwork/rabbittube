@@ -1,12 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Video } from "../types";
+import { VideoCardData } from "../types";
 import { clearHistory, getHistoryIds, getLikedIds, getWatchLaterIds } from "../lib/storage";
 import VideoCard from "./VideoCard";
 
 interface LibraryViewProps {
-  allVideos: Video[];
+  allVideos: VideoCardData[];
 }
 
 type TabType = "liked" | "watch_later" | "history";
@@ -33,8 +33,8 @@ export default function LibraryView({ allVideos }: LibraryViewProps) {
   const videoMap = new Map(allVideos.map((v) => [v.video_id, v]));
 
   // Get ordered videos for current tab
-  const getTabVideos = (ids: string[]): Video[] => {
-    const list: Video[] = [];
+  const getTabVideos = (ids: string[]): VideoCardData[] => {
+    const list: VideoCardData[] = [];
     for (const id of ids) {
       const v = videoMap.get(id);
       if (v) list.push(v);

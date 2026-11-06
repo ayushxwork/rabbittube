@@ -1,13 +1,13 @@
 # VideoHub
 
-VideoHub is a static, read-only index of YouTube videos that Hacker News commenters repeatedly recommended: a Python pipeline pulls comment data from the open-index/hacker-news dataset, keeps only videos linked by many distinct users across many distinct months, classifies the survivors with an AI model, and a Next.js site (static export) presents the results with search, topic filters, per-video pages, and a browser-stored Library (liked / watch later / history). It is an independent community project with no backend — everything is precomputed at build time and shipped as plain files.
+VideoHub is a static, read-only index of YouTube videos that Hacker News commenters repeatedly linked to: a Python pipeline pulls comment data from the open-index/hacker-news dataset, keeps only videos linked by many distinct users across many distinct months, enriches them with AI-generated summaries, topics and comment labels, and a Next.js site (static export) presents the results with search, topic filters, per-video pages, and a browser-stored Library (liked / watch later / history). It is an independent community project with no backend — everything is precomputed at build time and shipped as plain files.
 
 ## How it works
 
 1. **Extract** — `extract_hn.py` streams monthly Parquet files of Hacker News comments from the open-index/hacker-news dataset on Hugging Face, keeps comments that link to YouTube, strips HTML, and writes `comments.jsonl`.
-2. **Filter** — `pipeline.py` reads `comments.jsonl`, extracts YouTube video IDs, and keeps only candidates recommended by at least `--min-users` distinct users in at least `--min-months` distinct months (defaults: 2 users, 2 months), writing `candidates.json`.
-3. **Classify** — `classify.py` fetches titles/channels via YouTube's public oEmbed endpoint, asks Gemini (via its OpenAI-compatible endpoint, configured in `.env`) to summarize each video and label its comments, drops videos with fewer than 2 "recommend" mentions, and writes `videos.json`. Responses are cached in `cache/`, so re-runs are cheap.
-4. **Build** — `web/copy-data.js` copies `videos.json` into `web/data/`, then Next.js (`output: "export"`) builds the static site into `web/out/`.
+2. **Filter** — `pipeline.py` reads `comments.jsonl`, extracts YouTube video IDs, and keeps only videos linked by at least 3 distinct users in at least 3 distinct months, writing `candidates.json`.
+3. **Rank & classify** — `classify.py` ranks videos by how many distinct people linked them in the last 3 years, then by total distinct users, and takes the top ones; the site keeps that order. For each video it fetches the title and channel from YouTube's public oEmbed endpoint, then asks Gemini (via its OpenAI-compatible endpoint, configured in `.env`) for a one-line summary, a topic, and labels for a sample of comments; the summary, topic and labels are shown on the video page. Responses are cached in `cache/`, so re-runs are cheap. Output: `videos.json`.
+4. **Build** — `web/copy-data.js` copies a trimmed `videos.json` (video fields plus labeled comments only) into `web/data/`, then Next.js (`output: "export"`) builds the static site into `web/out/`.
 
 ## Run order
 
