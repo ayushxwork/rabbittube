@@ -29,8 +29,14 @@ from openai import OpenAI
 MIN_RECOMMEND_COUNT = 0
 
 # Free-tier rate limits: 15 RPM means >= 4.0s minimum interval per call;
-# 5.0s is used for headroom.
+# 5.0s is used for headroom. On a 429 the interval doubles for the rest of the
+# run (up to PACING_INTERVAL_CAP) and eases back toward this base after
+# PACING_RELAX_AFTER consecutive clean calls.
 REQUEST_INTERVAL_SECONDS = 5.0
+PACING_INTERVAL_CAP = 60.0
+PACING_RELAX_AFTER = 3
+# Live pacing state for the current run; reset by run_classification().
+PACE = {"interval": REQUEST_INTERVAL_SECONDS, "clean_calls": 0}
 OEMBED_INTERVAL_SECONDS = 0.3
 MAX_RETRIES = 2  # retry up to 2 times on invalid LLM output (3 attempts total)
 MAX_429_RETRIES = 3
@@ -367,6 +373,32 @@ def parse_and_validate_response(
     }, "OK"
 
 
+def note_rate_limit() -> float:
+    """Raise the adaptive pacing interval after a 429: double it, up to the cap."""
+    new_interval = min(PACE["interval"] * 2.0, PACING_INTERVAL_CAP)
+    if new_interval != PACE["interval"]:
+        PACE["interval"] = new_interval
+        print(
+            f"Pacing raised to {PACE['interval']:.1f}s per call "
+            f"(cap {PACING_INTERVAL_CAP:.1f}s)."
+        )
+    PACE["clean_calls"] = 0
+    return PACE["interval"]
+
+
+def note_clean_call() -> float:
+    """After PACING_RELAX_AFTER consecutive clean calls, ease pacing one step."""
+    if PACE["interval"] <= REQUEST_INTERVAL_SECONDS:
+        PACE["clean_calls"] = 0
+        return PACE["interval"]
+    PACE["clean_calls"] += 1
+    if PACE["clean_calls"] >= PACING_RELAX_AFTER:
+        PACE["interval"] = max(REQUEST_INTERVAL_SECONDS, PACE["interval"] / 2.0)
+        PACE["clean_calls"] = 0
+        print(f"Pacing relaxed to {PACE['interval']:.1f}s per call.")
+    return PACE["interval"]
+
+
 def call_gemini_classification(
     client: OpenAI,
     model: str,
@@ -459,6 +491,9 @@ def call_gemini_classification(
                         print(f"\n[FATAL] Daily quota cap reached on Gemini API: {err_msg}")
                         print("Stopping cleanly. All progress has been cached.")
                         sys.exit(0)
+
+                    # Adaptive pacing: back off subsequent calls in this run.
+                    note_rate_limit()
 
                     if rate_retry < MAX_429_RETRIES:
                         print(f"Rate limited (429). Backing off {backoff_sleep:.1f}s before retry {rate_retry + 1}/{MAX_429_RETRIES}...")
@@ -553,6 +588,10 @@ def run_classification(
     limit: Optional[int] = None,
 ) -> None:
     load_env()
+
+    # Reset adaptive pacing for this run (base interval, no pending backoff).
+    PACE["interval"] = REQUEST_INTERVAL_SECONDS
+    PACE["clean_calls"] = 0
 
     base_url = os.getenv("BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY")
@@ -655,7 +694,8 @@ def run_classification(
     print(f"API calls planned:          {calls_needed}")
     print(f"Model ID:                   {model}")
     print(f"Base URL:                   {base_url}")
-    print(f"Pacing interval:            {REQUEST_INTERVAL_SECONDS}s per call (<= 15 RPM limit)")
+    print(f"Pacing interval:            {REQUEST_INTERVAL_SECONDS}s base per call (<= 15 RPM limit; "
+          f"doubles up to {PACING_INTERVAL_CAP:.0f}s after 429s, eases back after {PACING_RELAX_AFTER} clean calls)")
     print(f"Recommend threshold:        >= {MIN_RECOMMEND_COUNT} 'recommend' labels required to keep")
     print("=" * 60 + "\n")
 
@@ -707,13 +747,14 @@ def run_classification(
                 classification_cache[vid] = classification
                 save_json_cache(CLASSIFICATION_CACHE_FILE, classification_cache)
                 print(f"Done. Topic: '{classification['topic']}'")
+                note_clean_call()  # adaptive pacing eases back after clean calls
             else:
                 classification_cache[vid] = failure_info or build_failure_info(
                     None, "Unknown classification failure"
                 )
                 save_json_cache(CLASSIFICATION_CACHE_FILE, classification_cache)
                 print("FAILED.")
-            time.sleep(REQUEST_INTERVAL_SECONDS)
+            time.sleep(PACE["interval"])
 
         # Skip failed classifications
         if not classification or classification.get("status") == "failed":
