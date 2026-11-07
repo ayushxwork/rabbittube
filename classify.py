@@ -468,7 +468,13 @@ def call_gemini_classification(
     coverage_retry_used = False
     for attempt in range(MAX_RETRIES + 1):
         backoff_sleep = 10.0
-        for rate_retry in range(MAX_429_RETRIES + 1):
+        # Independent retry budgets: a burst of 5xx must not consume the 429
+        # allowance and vice versa. Every `continue` consumes exactly one unit
+        # of one budget, so at most MAX_429_RETRIES + MAX_5XX_RETRIES retries
+        # happen per attempt and this loop stays bounded.
+        retries_429 = 0
+        retries_5xx = 0
+        for _ in range(MAX_429_RETRIES + MAX_5XX_RETRIES + 1):
             try:
                 response = client.chat.completions.create(
                     model=model,
@@ -495,20 +501,22 @@ def call_gemini_classification(
                     # Adaptive pacing: back off subsequent calls in this run.
                     note_rate_limit()
 
-                    if rate_retry < MAX_429_RETRIES:
-                        print(f"Rate limited (429). Backing off {backoff_sleep:.1f}s before retry {rate_retry + 1}/{MAX_429_RETRIES}...")
+                    if retries_429 < MAX_429_RETRIES:
+                        print(f"Rate limited (429). Backing off {backoff_sleep:.1f}s before retry {retries_429 + 1}/{MAX_429_RETRIES}...")
                         time.sleep(backoff_sleep)
                         backoff_sleep *= 2.0
+                        retries_429 += 1
                         continue
                     else:
                         print(f"Exceeded 429 retries for video {video_id}: {err_msg}")
                         return None, build_failure_info(e)
                 elif http_status in RETRYABLE_5XX:
                     # Transient server-side errors: bounded retries with 10s/20s/40s backoff
-                    if rate_retry < MAX_5XX_RETRIES:
-                        print(f"HTTP {http_status} from Gemini for video {video_id}. Backing off {backoff_sleep:.1f}s before retry {rate_retry + 1}/{MAX_5XX_RETRIES}...")
+                    if retries_5xx < MAX_5XX_RETRIES:
+                        print(f"HTTP {http_status} from Gemini for video {video_id}. Backing off {backoff_sleep:.1f}s before retry {retries_5xx + 1}/{MAX_5XX_RETRIES}...")
                         time.sleep(backoff_sleep)
                         backoff_sleep *= 2.0
+                        retries_5xx += 1
                         continue
                     else:
                         print(f"Exceeded 5xx retries for video {video_id}: {err_msg}")
@@ -516,6 +524,11 @@ def call_gemini_classification(
                 else:
                     print(f"API call error for video {video_id}: {err_msg}")
                     return None, build_failure_info(e)
+        else:
+            # Unreachable while both budgets above are enforced: every pass
+            # consumes budget, so the final slot must break (success) or return.
+            print(f"Marking video {video_id} as 'failed': retry budgets exhausted.")
+            return None, build_failure_info(None, "Retry budgets exhausted")
 
         # Validate JSON output
         is_valid, parsed_data, err_reason = parse_and_validate_response(raw_content, topics, expected_ids)
